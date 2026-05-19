@@ -1,19 +1,15 @@
 ; Matrix rain – pure x86-64 Linux NASM assembly
-; /dev/urandom  |  TIOCGWINSZ  |  ANSI escape codes  |  no libc
+; Usage: ./matrix [--density=1-9] [--speed=1-9] [--color=green|red|blue|cyan|yellow|white]
 
 DEFAULT REL
 global _start
 
-; ── constants ─────────────────────────────────────────────────────────────────
 MAX_COLS    equ 512
 BUF_SIZE    equ 65536
 RAND_BUF    equ 256
-MIN_LEN     equ 6
-MAX_LEN     equ 28
-MIN_SPEED   equ 1
-MAX_SPEED   equ 4
 TIOCGWINSZ  equ 0x5413
 SA_RESTORER equ 0x04000000
+SCHEME_SZ   equ 21             ; bytes per color scheme (3 seqs × 7 bytes)
 
 section .bss
     ws_row      resw 1
@@ -33,12 +29,25 @@ section .bss
     rand_pos    resq 1
     urand_fd    resq 1
     dec_scratch resb 32
-    sigact      resb 32         ; kernel_sigaction: handler,flags,restorer,mask
+    sigact      resb 32
+
+    ; runtime config (set to defaults in _start, then overridden by CLI args)
+    cfg_density     resb 1      ; 0-8  (user input 1-9, stored as index)
+    cfg_speed       resb 1      ; 0-8
+    cfg_color       resb 1      ; 0-5
+
+    ; derived from config by apply_config
+    seed_thresh     resb 1      ; rand_byte < thresh → seed column
+    wake_thresh     resb 1      ; rand_byte < thresh → wake idle column
+    g_min_speed     resb 1      ; drop: min frames-per-step
+    g_max_speed     resb 1
+    g_min_len       resb 1      ; drop: min trail length
+    g_max_len       resb 1
+    color_scheme_ptr resq 1     ; pointer to active scheme in color_schemes
 
 section .data
     dev_urandom     db "/dev/urandom", 0
 
-    ; startup / exit sequences
     seq_hide        db 0x1b, "[?25l"
     seq_hide_len    equ $ - seq_hide
     seq_show        db 0x1b, "[0m", 0x1b, "[?25h", 0x0a
@@ -46,30 +55,64 @@ section .data
     seq_cls         db 0x1b, "[2J", 0x1b, "[H"
     seq_cls_len     equ $ - seq_cls
 
-    ; cell colors
-    clr_head        db 0x1b, "[1;97m"      ; bright white  – leading char
+    ; head is always bright white regardless of color scheme
+    clr_head        db 0x1b, "[1;97m"
     clr_head_len    equ $ - clr_head
-    clr_bright      db 0x1b, "[1;32m"      ; bright green  – 1-2 behind head
-    clr_bright_len  equ $ - clr_bright
-    clr_normal      db 0x1b, "[0;32m"      ; normal green  – mid trail
-    clr_normal_len  equ $ - clr_normal
-    clr_dark        db 0x1b, "[2;32m"      ; dim green     – tail
-    clr_dark_len    equ $ - clr_dark
-    clr_erase       db 0x1b, "[0m "        ; reset + space – erase cell
+    clr_erase       db 0x1b, "[0m "
     clr_erase_len   equ $ - clr_erase
+
+    ; ── color schemes ─────────────────────────────────────────────────────────
+    ; Each scheme = 3 × 7-byte ANSI sequences: bright, normal, dark
+    ; Accessed via color_scheme_ptr + offset (0, 7, 14)
+    color_schemes:
+    db 0x1b,"[1;32m", 0x1b,"[0;32m", 0x1b,"[2;32m"  ; 0 green  (default)
+    db 0x1b,"[1;31m", 0x1b,"[0;31m", 0x1b,"[2;31m"  ; 1 red
+    db 0x1b,"[1;34m", 0x1b,"[0;34m", 0x1b,"[2;34m"  ; 2 blue
+    db 0x1b,"[1;36m", 0x1b,"[0;36m", 0x1b,"[2;36m"  ; 3 cyan
+    db 0x1b,"[1;33m", 0x1b,"[0;33m", 0x1b,"[2;33m"  ; 4 yellow
+    db 0x1b,"[0;97m", 0x1b,"[0;37m", 0x1b,"[2;37m"  ; 5 white
+
+    ; ── density tables (index 0=density1 … 8=density9) ───────────────────────
+    density_seed_tbl  db   4,  8, 16, 22, 30, 42, 60, 90, 128
+    density_wake_tbl  db   1,  1,  2,  3,  4,  6,  9, 15,  28
+
+    ; ── speed tables ──────────────────────────────────────────────────────────
+    ; Frame delay in nanoseconds (speed 1=slow … 9=fast)
+    speed_nsec_tbl  dq  90000000, 70000000, 55000000, 42000000, 33000000, \
+                        24000000, 16000000, 10000000,  6000000
+    ; Drop advance: frames-per-step (higher = slower drop)
+    drop_min_tbl    db  4, 3, 3, 2, 2, 2, 1, 1, 1
+    drop_max_tbl    db  8, 7, 6, 5, 4, 4, 3, 2, 2
+    ; Drop trail length
+    drop_len_min_tbl db  5,  5,  6,  6,  6,  8,  8, 10, 12
+    drop_len_max_tbl db 16, 18, 20, 22, 24, 26, 28, 30, 32
+
+    ; nanosleep timespec (tv_nsec overwritten by apply_config)
+    tv_sec  dq 0
+    tv_nsec dq 33000000
 
     chars   db "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
             db "0123456789@#$%^&*|/<>[]{}:;"
     chars_len equ $ - chars
 
-    ; nanosleep timespec  ~33 ms ≈ 30 fps
-    tv_sec  dq 0
-    tv_nsec dq 33000000
+    err_prefix      db "matrix: unknown option: "
+    err_prefix_len  equ $ - err_prefix
+    newline         db 0x0a
+
+    help_text:
+    db "Usage: matrix [--density=1-9] [--speed=1-9] [--color=SCHEME]", 0x0a
+    db 0x0a
+    db "Options:", 0x0a
+    db "  --density=1-9   Column density   (1=sparse ... 9=dense,  default 5)", 0x0a
+    db "  --speed=1-9     Animation speed  (1=slow   ... 9=fast,   default 5)", 0x0a
+    db "  --color=SCHEME  Color scheme     (default: green)", 0x0a
+    db "                  Schemes: green  red  blue  cyan  yellow  white", 0x0a
+    db "  --help          Show this message", 0x0a
+    help_text_len equ $ - help_text
 
 section .text
 
 ; ── signal handler ────────────────────────────────────────────────────────────
-; Called on SIGINT / SIGTERM.  Restore terminal and exit(0).
 sig_handler:
     mov     rax, 1
     mov     rdi, 1
@@ -80,31 +123,29 @@ sig_handler:
     mov     rax, 60
     syscall
 
-; Restorer trampoline required by the kernel when SA_RESTORER is set.
-; (We never actually return from sig_handler, so this is for correctness only.)
 sig_restorer:
-    mov     rax, 15             ; rt_sigreturn
+    mov     rax, 15
     syscall
 
-; ── flush: write wbuf[0..wbuf_pos) to stdout ─────────────────────────────────
+; ── flush ─────────────────────────────────────────────────────────────────────
 flush:
     mov     rdx, [wbuf_pos]
     test    rdx, rdx
     jz      .done
-    mov     rax, 1              ; write
-    mov     rdi, 1              ; stdout
+    mov     rax, 1
+    mov     rdi, 1
     lea     rsi, [wbuf]
     syscall
     mov     qword [wbuf_pos], 0
 .done:
     ret
 
-; ── buf_byte: append al to wbuf (flushes first if almost full) ───────────────
+; ── buf_byte ──────────────────────────────────────────────────────────────────
 buf_byte:
     mov     rcx, [wbuf_pos]
     cmp     rcx, BUF_SIZE - 64
     jb      .store
-    push    rax                 ; preserve al across flush (flush clobbers rax)
+    push    rax
     call    flush
     pop     rax
     mov     rcx, [wbuf_pos]
@@ -114,15 +155,14 @@ buf_byte:
     mov     [wbuf_pos], rcx
     ret
 
-; ── buf_bytes: append mem[rsi .. rsi+rdx) to wbuf ───────────────────────────
-; Clobbers: rax, rcx.  Preserves: everything else (rbx/r12/r13 saved).
+; ── buf_bytes: append mem[rsi..rsi+rdx) ──────────────────────────────────────
 buf_bytes:
     push    rbx
     push    r12
     push    r13
-    mov     rbx, rsi            ; source ptr
-    mov     r12, rdx            ; byte count
-    xor     r13, r13            ; index
+    mov     rbx, rsi
+    mov     r12, rdx
+    xor     r13, r13
 .lp:
     cmp     r13, r12
     jge     .done
@@ -136,14 +176,13 @@ buf_bytes:
     pop     rbx
     ret
 
-; ── buf_dec: append decimal representation of rax to wbuf ────────────────────
-; Clobbers: rax, rdx, rcx.  Preserves: rbx/r12/r13 (saved).
+; ── buf_dec: append decimal rax ───────────────────────────────────────────────
 buf_dec:
     push    rbx
     push    r12
     push    r13
     lea     rbx, [dec_scratch]
-    xor     r12, r12            ; digit count
+    xor     r12, r12
     test    rax, rax
     jnz     .cvt
     mov     byte [rbx], '0'
@@ -164,7 +203,6 @@ buf_dec:
     inc     r12
     jmp     .dloop
 .rev:
-    ; digits are in reverse order – flip them
     xor     r13, r13
     mov     rcx, r12
     dec     rcx
@@ -187,20 +225,19 @@ buf_dec:
     pop     rbx
     ret
 
-; ── buf_goto: emit ESC[row;colH  (row/col 1-based, passed in rdi/rsi) ─────────
-; Row and col are saved on the stack so called helpers can't corrupt them.
+; ── buf_goto: emit ESC[rdi;rsiH ──────────────────────────────────────────────
 buf_goto:
-    push    rdi                 ; row (1-based) at [rsp+8] after push rsi
-    push    rsi                 ; col (1-based) at [rsp]
+    push    rdi
+    push    rsi
     mov     al, 0x1b
     call    buf_byte
     mov     al, '['
     call    buf_byte
-    mov     rax, [rsp + 8]      ; reload row from stack
+    mov     rax, [rsp + 8]      ; row (reload from stack; called helpers may clobber rdi)
     call    buf_dec
     mov     al, ';'
     call    buf_byte
-    mov     rax, [rsp]          ; reload col from stack
+    mov     rax, [rsp]          ; col
     call    buf_dec
     mov     al, 'H'
     call    buf_byte
@@ -224,7 +261,6 @@ refill_rand:
     pop     rdi
     ret
 
-; → al = random byte 0–255
 rand_byte:
     mov     rax, [rand_pos]
     cmp     rax, RAND_BUF
@@ -236,33 +272,31 @@ rand_byte:
     inc     qword [rand_pos]
     ret
 
-; → rax = random value in [rdi, rsi] inclusive
 rand_range:
     push    rdi
     push    rsi
     sub     rsi, rdi
-    inc     rsi                 ; range width
+    inc     rsi
     call    rand_byte
     movzx   eax, al
     xor     rdx, rdx
-    div     rsi                 ; rdx = rax % width
+    div     rsi
     pop     rsi
     pop     rdi
     lea     rax, [rdx + rdi]
     ret
 
-; ── column management ─────────────────────────────────────────────────────────
-; Initialise column index rdi with random length/speed, head = 0.
+; ── column ────────────────────────────────────────────────────────────────────
 init_column:
     push    rbx
     mov     rbx, rdi
-    mov     qword [col_head  + rbx*8], 0
-    mov     rdi, MIN_LEN
-    mov     rsi, MAX_LEN
+    mov     qword [col_head + rbx*8], 0
+    movzx   rdi, byte [g_min_len]
+    movzx   rsi, byte [g_max_len]
     call    rand_range
     mov     [col_len   + rbx*8], rax
-    mov     rdi, MIN_SPEED
-    mov     rsi, MAX_SPEED
+    movzx   rdi, byte [g_min_speed]
+    movzx   rsi, byte [g_max_speed]
     call    rand_range
     mov     [col_speed + rbx*8], rax
     mov     [col_timer + rbx*8], rax
@@ -270,7 +304,6 @@ init_column:
     pop     rbx
     ret
 
-; → al = random printable char from the matrix charset
 random_char:
     mov     rdi, 0
     mov     rsi, chars_len - 1
@@ -278,13 +311,12 @@ random_char:
     movzx   eax, byte [chars + rax]
     ret
 
-; ── draw_cell: cursor to (r12 row, rbx col) then write a char ────────────────
-; Color escape must be emitted by the caller before calling draw_cell.
+; ── draw / erase ──────────────────────────────────────────────────────────────
 draw_cell:
     push    rdi
     push    rsi
-    lea     rdi, [r12 + 1]      ; 1-based row
-    lea     rsi, [rbx + 1]      ; 1-based col
+    lea     rdi, [r12 + 1]
+    lea     rsi, [rbx + 1]
     call    buf_goto
     call    random_char
     call    buf_byte
@@ -292,28 +324,22 @@ draw_cell:
     pop     rdi
     ret
 
-; ── erase_cell: overwrite (r12 row, rbx col) with a blank ───────────────────
 erase_cell:
     push    rdi
     push    rsi
     lea     rdi, [r12 + 1]
     lea     rsi, [rbx + 1]
     call    buf_goto
-    lea     rsi, [clr_erase]    ; ESC[0m + space
+    lea     rsi, [clr_erase]
     mov     rdx, clr_erase_len
     call    buf_bytes
     pop     rsi
     pop     rdi
     ret
 
-; ── update_and_draw: advance every column and render ─────────────────────────
-;
-; Register conventions (caller-saved across this function):
-;   rbx = current column index
-;   r12 = scratch row value
-;   r13 = rows count / trail_start (reused)
-;   r14 = col_len or trail_start
-;   r15 = cols count / trail_end (reused)
+; ── update_and_draw ───────────────────────────────────────────────────────────
+; Each advance touches at most 5 cells: new head, 3 trail transitions, erase tail.
+; Trail cells are written once; only the head redraws every frame (flicker).
 update_and_draw:
     push    rbx
     push    r12
@@ -331,31 +357,26 @@ update_and_draw:
     cmp     byte [col_active + rbx], 0
     je      .next_col
 
-    ; tick timer
     dec     qword [col_timer + rbx*8]
-    jnz     .redraw_head        ; not time to move
+    jnz     .redraw_head
 
     ; ── advance head ──────────────────────────────────────────────────────────
     mov     rax, [col_speed + rbx*8]
     mov     [col_timer + rbx*8], rax
 
     inc     qword [col_head + rbx*8]
-    mov     r12, [col_head + rbx*8]   ; r12  = head counter
-    mov     r14, [col_len  + rbx*8]   ; r14  = trail length
-    mov     r13, [rows]             ; r13  = total rows
+    mov     r12, [col_head + rbx*8]
+    mov     r14, [col_len  + rbx*8]
+    mov     r13, [rows]
 
-    ; tail position (0-based) = r12 - r14 - 1
-    ; when tail >= rows the whole drop has scrolled off
+    ; deactivate when tail has fully left the screen
     mov     rax, r12
     sub     rax, r14
     dec     rax
     cmp     rax, r13
     jge     .deactivate
 
-    ; erase trailing cell when it has scrolled on-screen
-    mov     rax, r12
-    sub     rax, r14
-    dec     rax                 ; tail row (0-based)
+    ; erase tail cell
     test    rax, rax
     js      .skip_erase
     cmp     rax, r13
@@ -366,95 +387,37 @@ update_and_draw:
     pop     r12
 .skip_erase:
 
-    ; draw head char at row (r12 - 1) in bright white
+%macro draw_row 2   ; %1=offset from r12, %2=color offset in scheme (or -1 for head)
     mov     rax, r12
-    dec     rax
+    sub     rax, %1
     cmp     rax, 0
-    js      .draw_trail
+    js      %%skip
     cmp     rax, r13
-    jge     .draw_trail
+    jge     %%skip
     push    r12
     mov     r12, rax
+%if %2 < 0
     lea     rsi, [clr_head]
     mov     rdx, clr_head_len
+%else
+    mov     rsi, [color_scheme_ptr]
+    add     rsi, %2
+    mov     rdx, 7
+%endif
     call    buf_bytes
     call    draw_cell
     pop     r12
+%%skip:
+%endmacro
 
-.draw_trail:
-    ; bright green at row (r12 - 2)
-    mov     rax, r12
-    sub     rax, 2
-    cmp     rax, 0
-    js      .draw_normal
-    cmp     rax, r13
-    jge     .draw_normal
-    push    r12
-    mov     r12, rax
-    lea     rsi, [clr_bright]
-    mov     rdx, clr_bright_len
-    call    buf_bytes
-    call    draw_cell
-    pop     r12
+    draw_row 1, -1   ; head: bright white
+    draw_row 2,  0   ; bright  (scheme offset 0)
+    draw_row 3,  7   ; normal  (scheme offset 7)
+    draw_row 4, 14   ; dark    (scheme offset 14)
 
-.draw_normal:
-    ; trail rows from max(0, r12-r14) up to r12-3 (exclusive)
-    mov     rax, r12
-    sub     rax, r14            ; trail start (may be negative)
-    test    rax, rax
-    jns     .ts_ok
-    xor     rax, rax
-.ts_ok:
-    mov     r14, rax            ; r14 = trail_start (0-based)
-
-    mov     rax, r12
-    sub     rax, 3              ; trail end (exclusive)
-    test    rax, rax
-    js      .trail_skip         ; nothing to draw
-    cmp     r14, rax
-    jge     .trail_skip
-
-    push    r12
-    push    r15
-    mov     r15, rax            ; r15 = trail_end
-    mov     r12, r14            ; r12 = current trail row
-
-.tloop:
-    cmp     r12, r15
-    jge     .tloop_done
-    cmp     r12, 0
-    js      .tinc
-    cmp     r12, [rows]
-    jge     .tloop_done
-
-    ; lower half of trail → dim; upper half → normal green
-    mov     rcx, [col_len + rbx*8]
-    shr     rcx, 1
-    mov     rdx, r12
-    sub     rdx, r14
-    cmp     rdx, rcx
-    jl      .tdark
-    lea     rsi, [clr_normal]
-    mov     rdx, clr_normal_len
-    call    buf_bytes
-    jmp     .tcell
-.tdark:
-    lea     rsi, [clr_dark]
-    mov     rdx, clr_dark_len
-    call    buf_bytes
-.tcell:
-    call    draw_cell
-.tinc:
-    inc     r12
-    jmp     .tloop
-.tloop_done:
-    pop     r15
-    pop     r12
-
-.trail_skip:
     jmp     .next_col
 
-    ; ── redraw head only (flicker) ────────────────────────────────────────────
+    ; ── redraw head only (flicker, no trail update) ───────────────────────────
 .redraw_head:
     mov     r12, [col_head + rbx*8]
     dec     r12
@@ -476,7 +439,7 @@ update_and_draw:
     jmp     .col_loop
 
 .col_done:
-    ; randomly activate idle columns (~3% chance per frame)
+    ; randomly wake idle columns
     mov     r15, [cols]
     xor     rbx, rbx
 .wake_loop:
@@ -485,7 +448,8 @@ update_and_draw:
     cmp     byte [col_active + rbx], 0
     jne     .wake_next
     call    rand_byte
-    cmp     al, 7
+    movzx   ecx, byte [wake_thresh]
+    cmp     al, cl
     jge     .wake_next
     mov     rdi, rbx
     call    init_column
@@ -501,8 +465,197 @@ update_and_draw:
     pop     rbx
     ret
 
+; ── parse_arg ─────────────────────────────────────────────────────────────────
+; rdi = arg string (not modified)
+; → rax: 0 = handled, 1 = --help, 2 = unrecognised -- option
+parse_arg:
+    cmp     byte [rdi], '-'
+    jne     .ok             ; not a flag at all → ignore
+    cmp     byte [rdi + 1], '-'
+    jne     .ok
+    movzx   eax, byte [rdi + 2]
+    cmp     al, 'h'
+    je      .help
+    cmp     al, 'd'
+    je      .density
+    cmp     al, 's'
+    je      .speed
+    cmp     al, 'c'
+    je      .color
+    jmp     .unknown
+
+.help:
+    cmp     byte [rdi + 3], 'e'
+    jne     .unknown
+    cmp     byte [rdi + 4], 'l'
+    jne     .unknown
+    cmp     byte [rdi + 5], 'p'
+    jne     .unknown
+    mov     eax, 1
+    ret
+
+.density:
+    cmp     byte [rdi +  3], 'e'
+    jne     .unknown
+    cmp     byte [rdi +  4], 'n'
+    jne     .unknown
+    cmp     byte [rdi +  5], 's'
+    jne     .unknown
+    cmp     byte [rdi +  6], 'i'
+    jne     .unknown
+    cmp     byte [rdi +  7], 't'
+    jne     .unknown
+    cmp     byte [rdi +  8], 'y'
+    jne     .unknown
+    cmp     byte [rdi +  9], '='
+    jne     .unknown
+    movzx   eax, byte [rdi + 10]
+    sub     al, '1'
+    cmp     al, 8
+    ja      .unknown
+    mov     [cfg_density], al
+    jmp     .ok
+
+.speed:
+    cmp     byte [rdi + 3], 'p'
+    jne     .unknown
+    cmp     byte [rdi + 4], 'e'
+    jne     .unknown
+    cmp     byte [rdi + 5], 'e'
+    jne     .unknown
+    cmp     byte [rdi + 6], 'd'
+    jne     .unknown
+    cmp     byte [rdi + 7], '='
+    jne     .unknown
+    movzx   eax, byte [rdi + 8]
+    sub     al, '1'
+    cmp     al, 8
+    ja      .unknown
+    mov     [cfg_speed], al
+    jmp     .ok
+
+.color:
+    cmp     byte [rdi + 3], 'o'
+    jne     .unknown
+    cmp     byte [rdi + 4], 'l'
+    jne     .unknown
+    cmp     byte [rdi + 5], 'o'
+    jne     .unknown
+    cmp     byte [rdi + 6], 'r'
+    jne     .unknown
+    cmp     byte [rdi + 7], '='
+    jne     .unknown
+    movzx   eax, byte [rdi + 8]
+    cmp     al, 'g'
+    je      .c0
+    cmp     al, 'r'
+    je      .c1
+    cmp     al, 'b'
+    je      .c2
+    cmp     al, 'c'
+    je      .c3
+    cmp     al, 'y'
+    je      .c4
+    cmp     al, 'w'
+    je      .c5
+    jmp     .unknown
+.c0: mov byte [cfg_color], 0  ; green
+     jmp .ok
+.c1: mov byte [cfg_color], 1  ; red
+     jmp .ok
+.c2: mov byte [cfg_color], 2  ; blue
+     jmp .ok
+.c3: mov byte [cfg_color], 3  ; cyan
+     jmp .ok
+.c4: mov byte [cfg_color], 4  ; yellow
+     jmp .ok
+.c5: mov byte [cfg_color], 5  ; white
+
+.ok:
+    xor     eax, eax
+    ret
+
+.unknown:
+    mov     eax, 2
+    ret
+
+; ── print_help_exit: write help to stdout, then exit(code in rdi) ─────────────
+print_help_exit:
+    push    rdi                 ; save exit code
+    mov     rax, 1
+    mov     rdi, 1
+    lea     rsi, [help_text]
+    mov     rdx, help_text_len
+    syscall
+    pop     rdi
+    mov     rax, 60
+    syscall
+
+; ── print_unknown_arg: "matrix: unknown option: ARG\n" to stderr ─────────────
+; rdi = pointer to the unknown arg string
+print_unknown_arg:
+    push    rdi
+    mov     rax, 1
+    mov     rdi, 2              ; stderr
+    lea     rsi, [err_prefix]
+    mov     rdx, err_prefix_len
+    syscall
+    pop     rsi                 ; arg string
+    push    rsi
+    ; compute strlen(arg)
+    xor     rcx, rcx
+.sl: cmp    byte [rsi + rcx], 0
+    je      .sl_done
+    inc     rcx
+    jmp     .sl
+.sl_done:
+    mov     rdx, rcx
+    mov     rax, 1
+    mov     rdi, 2
+    syscall
+    mov     rax, 1
+    mov     rdi, 2
+    lea     rsi, [newline]
+    mov     rdx, 1
+    syscall
+    pop     rdi                 ; discard saved ptr
+    ret
+
+; ── apply_config: translate cfg_* into runtime parameters ────────────────────
+apply_config:
+    ; density → seed + wake thresholds
+    movzx   rax, byte [cfg_density]
+    movzx   rcx, byte [density_seed_tbl + rax]
+    mov     [seed_thresh], cl
+    movzx   rcx, byte [density_wake_tbl + rax]
+    mov     [wake_thresh], cl
+
+    ; speed → frame delay + drop speed/length ranges
+    movzx   rax, byte [cfg_speed]
+    mov     rcx, [speed_nsec_tbl + rax*8]
+    mov     [tv_nsec], rcx
+    movzx   rcx, byte [drop_min_tbl + rax]
+    mov     [g_min_speed], cl
+    movzx   rcx, byte [drop_max_tbl + rax]
+    mov     [g_max_speed], cl
+    movzx   rcx, byte [drop_len_min_tbl + rax]
+    mov     [g_min_len], cl
+    movzx   rcx, byte [drop_len_max_tbl + rax]
+    mov     [g_max_len], cl
+
+    ; color → scheme pointer
+    movzx   eax, byte [cfg_color]
+    imul    eax, eax, SCHEME_SZ
+    lea     rcx, [color_schemes + rax]
+    mov     [color_scheme_ptr], rcx
+
+    ret
+
 ; ── _start ────────────────────────────────────────────────────────────────────
 _start:
+    ; save stack pointer to access argc/argv (rsp not touched yet)
+    mov     r14, rsp            ; r14 = original stack pointer
+
     ; open /dev/urandom
     mov     rax, 2
     lea     rdi, [dev_urandom]
@@ -513,7 +666,7 @@ _start:
     js      .err
     mov     [urand_fd], rax
 
-    ; get terminal size (falls back to 24×80 if not a tty)
+    ; get terminal dimensions
     mov     rax, 16
     mov     rdi, 1
     mov     rsi, TIOCGWINSZ
@@ -538,6 +691,40 @@ _start:
 .cols_ok2:
     mov     [cols], rax
 
+    ; set defaults: density 5, speed 5, color green  (indices are 0-based)
+    mov     byte [cfg_density], 4
+    mov     byte [cfg_speed],   4
+    mov     byte [cfg_color],   0
+
+    ; parse argv
+    mov     r13, [r14]          ; argc
+    lea     r15, [r14 + 16]     ; &argv[1]
+    dec     r13                 ; number of real args
+.arg_loop:
+    test    r13, r13
+    jz      .arg_done
+    mov     rdi, [r15]
+    call    parse_arg
+    cmp     rax, 1
+    je      .do_help
+    cmp     rax, 2
+    je      .do_unknown
+    add     r15, 8
+    dec     r13
+    jmp     .arg_loop
+.do_help:
+    xor     rdi, rdi            ; exit code 0
+    call    print_help_exit     ; does not return
+.do_unknown:
+    mov     rdi, [r15]          ; reload arg pointer (parse_arg preserves rdi but be safe)
+    call    print_unknown_arg
+    xor     rdi, rdi
+    mov     rdi, 1              ; exit code 1
+    call    print_help_exit     ; does not return
+.arg_done:
+
+    call    apply_config
+
     ; install SIGINT + SIGTERM → sig_handler
     lea     rax, [sig_handler]
     mov     [sigact], rax
@@ -546,15 +733,15 @@ _start:
     mov     [sigact + 16], rax
     mov     qword [sigact + 24], 0
 
-    mov     rax, 13             ; rt_sigaction
-    mov     rdi, 2              ; SIGINT
+    mov     rax, 13
+    mov     rdi, 2
     lea     rsi, [sigact]
     xor     rdx, rdx
     mov     r10, 8
     syscall
 
     mov     rax, 13
-    mov     rdi, 15             ; SIGTERM
+    mov     rdi, 15
     lea     rsi, [sigact]
     xor     rdx, rdx
     mov     r10, 8
@@ -572,38 +759,36 @@ _start:
     mov     rdx, seq_cls_len
     syscall
 
-    ; pre-fill random buffer so seeds are genuinely random
     call    refill_rand
 
-    ; seed half the columns with staggered start rows
+    ; seed columns
     mov     r15, [cols]
     xor     rbx, rbx
 .seed:
     cmp     rbx, r15
     jge     .seed_done
     call    rand_byte
-    cmp     al, 128
+    movzx   ecx, byte [seed_thresh]
+    cmp     al, cl
     jge     .seed_skip
     mov     rdi, rbx
     call    init_column
-    ; choose a random starting row so columns don't all begin at the top
     call    rand_byte
     movzx   eax, al
     xor     rdx, rdx
-    div     qword [rows]        ; rdx = rax % rows
-    inc     rdx                 ; col_head = rdx+1 so drawn head row = rdx
+    div     qword [rows]
+    inc     rdx
     mov     [col_head + rbx*8], rdx
 .seed_skip:
     inc     rbx
     jmp     .seed
 .seed_done:
 
-    ; main loop
 .loop:
     call    update_and_draw
     call    flush
 
-    mov     rax, 35             ; nanosleep
+    mov     rax, 35
     lea     rdi, [tv_sec]
     xor     rsi, rsi
     syscall
