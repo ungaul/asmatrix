@@ -17,13 +17,13 @@ jobs:
         run: make
 
       - name: Smoke test
-        run: ./matrix --help
+        run: ./asmatrix --help
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: matrix-linux-x86_64
-          path: matrix
+          name: asmatrix-linux-x86_64
+          path: asmatrix
           retention-days: 7
 
   release:
@@ -36,14 +36,11 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: matrix-linux-x86_64
-
-      - name: Rename for release
-        run: mv matrix matrix-linux-x86_64
+          name: asmatrix-linux-x86_64
 
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           name: Latest Build
-          files: matrix-linux-x86_64
+          files: asmatrix-linux-x86_64
           generate_release_notes: false

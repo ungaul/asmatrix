@@ -1,12 +1,12 @@
-TARGET = matrix
+TARGET = asmatrix
 
 all: $(TARGET)
 
 $(TARGET): matrix.asm
-	nasm -f elf64 -o matrix.o matrix.asm
-	ld -o matrix matrix.o
+	nasm -f elf64 -o asmatrix.o matrix.asm
+	ld -o asmatrix asmatrix.o
 
 clean:
-	rm -f matrix.o matrix
+	rm -f asmatrix.o asmatrix
 
 .PHONY: all clean
