@@ -2,6 +2,8 @@
 
 Matrix rain in pure x86-64 Linux assembly. Runs in about 40KB RSS.
 
+![color picker](./assets/demo.gif)
+
 ## Install
 ```bash
 chmod +x matrix-linux-x86_64
