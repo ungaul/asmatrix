@@ -1,0 +1,4 @@
+.claude
+*.o
+matrix
+*.txt
