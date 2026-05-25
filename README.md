@@ -6,8 +6,7 @@ Matrix rain in pure x86-64 Linux assembly. Runs in about 40KB RSS.
 
 ## Install
 ```bash
-chmod +x matrix-linux-x86_64
-./matrix-linux-x86_64
+sudo curl -fsSL https://github.com/ungaul/asmatrix/releases/download/latest/asmatrix-linux-x86_64 -o /usr/local/bin/asmatrix && sudo chmod +x /usr/local/bin/asmatrix
 ```
 
 ## Build from source
