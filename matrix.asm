@@ -76,20 +76,34 @@ section .data
     ; head is always bright white regardless of color scheme
     clr_head        db 0x1b, "[0;38;2;255;255;255m"
     clr_head_len    equ $ - clr_head
+
+    ; Trail level 2 ("dark"). Only the 3 cells right behind the head are drawn
+    ; in the chosen color each frame (head/bright/normal/dark) — everything
+    ; further back simply keeps whatever was last painted there, i.e. this
+    ; "dark" sequence. So this is really "the rest of the trail"'s color, and
+    ; it's deliberately a flat neutral gray rather than a dim shade of the
+    ; chosen hue: that's what gives the classic "glows near the head, fades to
+    ; a dim monochrome smear behind it" look, regardless of --color.
+    clr_mono        db 0x1b, "[0;38;2;70;70;70m"
+    clr_mono_len    equ $ - clr_mono
+
     clr_erase       db 0x1b, "[0m "
     clr_erase_len   equ $ - clr_erase
 
-    ; ── named color schemes ───────────────────────────────────────────────────
-    ; Each = 3 × 7-byte indexed-ANSI sequences (bright, normal, dark). Using
-    ; indexed colors (not truecolor RGB) here is deliberate.
-    color_schemes:
-    db 0x1b,"[0;92m", 0x1b,"[0;32m", 0x1b,"[2;32m"  ; 0 green  (default)
-    db 0x1b,"[0;91m", 0x1b,"[0;31m", 0x1b,"[2;31m"  ; 1 red
-    db 0x1b,"[0;94m", 0x1b,"[0;34m", 0x1b,"[2;34m"  ; 2 blue
-    db 0x1b,"[0;96m", 0x1b,"[0;36m", 0x1b,"[2;36m"  ; 3 cyan
-    db 0x1b,"[0;93m", 0x1b,"[0;33m", 0x1b,"[2;33m"  ; 4 yellow
-    db 0x1b,"[0;97m", 0x1b,"[0;37m", 0x1b,"[2;37m"  ; 5 white
-    SCHEME_SZ equ 21            ; bytes per scheme (3 × 7-byte sequences)
+    ; ── named color RGB bases ─────────────────────────────────────────────────
+    ; Indexed-ANSI named colors are a dead end: a terminal can remap any/all
+    ; of the 16 palette slots to whatever it wants (some "Matrix" themes remap
+    ; literally everything to shades of green), so a requested name might not
+    ; resemble its name at all. Truecolor RGB bypasses the palette and forces
+    ; the literal hue the user asked for; emit_color_seq derives the
+    ; bright/normal/dark trail gradient from these via scale_component.
+    color_rgb:
+    db   0, 255,  70                ; 0 green  (default) — cool "Matrix" green, not lime
+    db 255,  50,  50                ; 1 red
+    db  60, 130, 255                ; 2 blue
+    db   0, 230, 230                ; 3 cyan
+    db 255, 210,   0                ; 4 yellow
+    db 255, 255, 255                ; 5 white
 
     ; ── density tables (index 0=density1 … 8=density9) ───────────────────────
     density_seed_tbl  db   4,  8, 16, 22, 30, 42, 60, 90, 128
@@ -634,31 +648,26 @@ dec_to_buf:
     pop     rbx
     ret
 
-; ── scale_component: dim a 0-255 channel for the normal/dark trail levels ────
-; eax = channel value, esi = level (0=normal ≈62%, 1=bright =100%, 2=dark ≈25%)
+; ── scale_component: dim a 0-255 channel for the normal trail level ──────────
+; eax = channel value, esi = level (0=normal ≈75%, 1=bright =100%)
 ; → eax = scaled value
-; Truecolor gradients can't rely on the terminal's bold/dim handling — many
-; terminals render SGR 1/2 with truecolor RGB as same-color-different-weight,
-; which flattens the bright/normal/dark trail into one flat shade. Scaling the
-; RGB ourselves guarantees the fade regardless of terminal.
+; (level 2 "dark" doesn't go through here — see clr_mono.) Truecolor gradients
+; can't rely on the terminal's bold/dim handling — many terminals render SGR
+; 1/2 with truecolor RGB as same-color-different-weight, which flattens the
+; bright/normal trail into one flat shade. Scaling the RGB ourselves
+; guarantees the fade regardless of terminal.
 scale_component:
     cmp     esi, 1
     je      .bright
-    cmp     esi, 2
-    je      .dark
-    imul    eax, eax, 5         ; normal ≈ value * 5/8
-    shr     eax, 3
-    ret
-.dark:
-    shr     eax, 2              ; dark ≈ value / 4
+    imul    eax, eax, 3         ; normal ≈ value * 3/4 (75%)
+    shr     eax, 2
     ret
 .bright:
     ret
 
 ; ── emit_color_seq: build one ANSI SGR sequence at [rdi] ──────────────────────
-; Only used for explicit hex / ANSI-256 color specs (cfg_color_mode 1 or 2);
-; named colors are handled directly from the static color_schemes table in
-; apply_config, so the terminal's own palette can render them.
+; Used for every color spec (named, hex, ANSI-256) — see color_rgb for why
+; named colors are resolved to truecolor RGB rather than indexed palette slots.
 ; rdi = dest buffer, rsi = brightness level (0=normal, 1=bright, 2=dark)
 ; Reads cfg_color_mode/cfg_color_a/b/c.
 ;   mode 1 truecolor: "ESC[0;38;2;R;G;Bm" with R/G/B scaled per level (the
@@ -849,9 +858,9 @@ parse_color_value:
 
 .not_numeric:
     ; known color names, matched by first letter (kept simple, like before).
-    ; These map to indices into color_schemes (mode 0): letting the terminal
-    ; render indexed-ANSI bold/normal/dim is what gives that familiar muted
-    ; trail fade, themed by whatever palette the user's terminal applies.
+    ; Look up the name's RGB base in color_rgb and load it into cfg_color_a/b/c
+    ; as truecolor (mode 1) — see the comment on color_rgb for why indexed
+    ; palette colors aren't used here.
     movzx   eax, byte [rbx]
     cmp     al, 'g'
     je      .name_green
@@ -867,19 +876,27 @@ parse_color_value:
     je      .name_white
     jmp     .fail
 
-.name_green:  mov byte [cfg_color_a], 0
+.name_green:  mov r12d, 0
               jmp .name_done
-.name_red:    mov byte [cfg_color_a], 1
+.name_red:    mov r12d, 1
               jmp .name_done
-.name_blue:   mov byte [cfg_color_a], 2
+.name_blue:   mov r12d, 2
               jmp .name_done
-.name_cyan:   mov byte [cfg_color_a], 3
+.name_cyan:   mov r12d, 3
               jmp .name_done
-.name_yellow: mov byte [cfg_color_a], 4
+.name_yellow: mov r12d, 4
               jmp .name_done
-.name_white:  mov byte [cfg_color_a], 5
+.name_white:  mov r12d, 5
 .name_done:
-    mov     byte [cfg_color_mode], 0    ; 0 = named (color_schemes table index)
+    imul    eax, r12d, 3
+    lea     rcx, [color_rgb + rax]
+    movzx   eax, byte [rcx + 0]
+    mov     [cfg_color_a], al
+    movzx   eax, byte [rcx + 1]
+    mov     [cfg_color_b], al
+    movzx   eax, byte [rcx + 2]
+    mov     [cfg_color_c], al
+    mov     byte [cfg_color_mode], 1    ; 1 = truecolor RGB
     xor     eax, eax
     jmp     .done
 
@@ -1063,36 +1080,11 @@ apply_config:
     movzx   rcx, byte [drop_len_max_tbl + rax]
     mov     [g_max_len], cl
 
-    ; color → fill scheme_seq with bright(0)/normal(1)/dark(2) sequences
-    cmp     byte [cfg_color_mode], 0
-    jne     .color_dynamic
-
-    ; named: copy the matching scheme's 3 × 7-byte sequences from color_schemes
-    ; (packed back-to-back) into the 32-byte-aligned scheme_seq slots, so the
-    ; terminal's own palette renders the bold/normal/dim trail fade
-    movzx   eax, byte [cfg_color_a]
-    imul    eax, eax, SCHEME_SZ
-    lea     rsi, [color_schemes + rax]
-
-    lea     rdi, [scheme_seq]
-    mov     rcx, 7
-    rep     movsb               ; bright  (rsi/rdi both auto-advance by 7)
-
-    lea     rdi, [scheme_seq + 32]
-    mov     rcx, 7
-    rep     movsb               ; normal
-
-    lea     rdi, [scheme_seq + 64]
-    mov     rcx, 7
-    rep     movsb               ; dark
-
-    mov     qword [scheme_seq_len + 0*8], 7
-    mov     qword [scheme_seq_len + 1*8], 7
-    mov     qword [scheme_seq_len + 2*8], 7
-    jmp     .color_done
-
-.color_dynamic:
-    ; hex / ANSI-256: generate bright(1)/normal(0)/dark(2) sequences
+    ; color → fill scheme_seq with bright(0)/normal(1)/dark(2) sequences.
+    ; bright/normal come from emit_color_seq so the requested color always
+    ; renders as itself (see color_rgb for why named colors don't use the
+    ; indexed palette). dark is a fixed neutral gray (clr_mono) — see its
+    ; comment for why: it's what "the rest of the trail" ends up painted in.
     lea     rdi, [scheme_seq]
     mov     rsi, 1
     call    emit_color_seq
@@ -1104,11 +1096,10 @@ apply_config:
     mov     [scheme_seq_len + 1*8], rax
 
     lea     rdi, [scheme_seq + 64]
-    mov     rsi, 2
-    call    emit_color_seq
-    mov     [scheme_seq_len + 2*8], rax
-
-.color_done:
+    lea     rsi, [clr_mono]
+    mov     rcx, clr_mono_len
+    rep     movsb
+    mov     qword [scheme_seq_len + 2*8], clr_mono_len
     ret
 
 ; ── _start ────────────────────────────────────────────────────────────────────
@@ -1154,8 +1145,10 @@ _start:
     ; set defaults: density 7, speed 5, color green  (indices are 0-based)
     mov     byte [cfg_density], 4
     mov     byte [cfg_speed],   6
-    mov     byte [cfg_color_mode], 0    ; 0 = named (color_schemes table index)
-    mov     byte [cfg_color_a], 0       ; index 0 = green
+    mov     byte [cfg_color_mode], 1    ; 1 = truecolor RGB
+    mov     byte [cfg_color_a], 0       ; R — color_rgb[0] = green (0,255,70)
+    mov     byte [cfg_color_b], 255     ; G
+    mov     byte [cfg_color_c], 70      ; B
 
     ; parse argv
     mov     r13, [r14]          ; argc
