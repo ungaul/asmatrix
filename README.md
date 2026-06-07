@@ -5,7 +5,7 @@ Matrix rain in pure x86-64 Linux assembly.
 > I did this in order to see the potential of Assembly, and how even low-level languages can compare in raw performance for the same result.
 
  Benchmarks:
-| Metric | asmatrix | cmatrix | Ratio |
+| Metric | asmatrix | cmatrix |
 |---|---|---|---|
 | CPU cycles | 11,251,832 | 193,819,938 |
 | Instructions | 10,825,898 | 220,158,233 |
