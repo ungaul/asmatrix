@@ -1,8 +1,19 @@
 # asmatrix
 
-Matrix rain in pure x86-64 Linux assembly. Runs in about 40KB RSS.
+Matrix rain in pure x86-64 Linux assembly.
 
-![color picker](./assets/demo.gif)
+> I did this in order to see the potential of Assembly, and how even low-level languages can compare in raw performance for the same result.
+
+ Benchmarks:
+| Metric | asmatrix | cmatrix | Ratio |
+|---|---|---|---|
+| CPU cycles | 11,251,832 | 193,819,938 |
+| Instructions | 10,825,898 | 220,158,233 |
+| Cache misses | 3,897 | 156,683 |
+| RSS (physical RAM) | 40 kB | 4,728 kB |
+| Virtual memory | 256 kB | 6,336 kB |
+
+![preview](./assets/preview.gif)
 
 ## Install
 ```bash
@@ -13,16 +24,16 @@ sudo curl -fsSL https://github.com/ungaul/asmatrix/releases/download/latest/asma
 Requires `nasm` and `ld` (binutils).
 ```bash
 make
-./matrix
+chmod +x ./asmatrix
+sudo cp ./asmatrix /usr/local/bin/ 
 ```
 
 ## Usage
 ```bash
-./matrix [--density=1-9] [--speed=1-9] [--color=SCHEME]
+asmatrix [--density 1-9] [--speed 1-9] [--color SPEC]
 
-  --density=1-9   Column density   (1=sparse ... 9=dense,  default 5)
-  --speed=1-9     Animation speed  (1=slow   ... 9=fast,   default 5)
-  --color=SCHEME  Color scheme     (default: green)
-                  Schemes: green  red  blue  cyan  yellow  white
+  --density 1-9   Column density   (1=sparse ... 9=dense,  default 5)
+  --speed 1-9     Animation speed  (1=slow   ... 9=fast,   default 7)
+  --color SPEC    Color: name, hex (#RRGGBB), or ANSI 0-255  (default: green)
   --help          Show this message
 ```
