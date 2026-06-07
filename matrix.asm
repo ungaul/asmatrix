@@ -74,23 +74,20 @@ section .data
     seq_cls_len     equ $ - seq_cls
 
     ; head is always bright white regardless of color scheme
-    clr_head        db 0x1b, "[1;38;2;255;255;255m"
+    clr_head        db 0x1b, "[0;38;2;255;255;255m"
     clr_head_len    equ $ - clr_head
     clr_erase       db 0x1b, "[0m "
     clr_erase_len   equ $ - clr_erase
 
     ; ── named color schemes ───────────────────────────────────────────────────
     ; Each = 3 × 7-byte indexed-ANSI sequences (bright, normal, dark). Using
-    ; indexed colors (not truecolor RGB) here is deliberate: it lets the
-    ; terminal's own palette/theme render the bold/normal/dim variants, which
-    ; gives that familiar muted, low-contrast trail fade — exactly how this
-    ; looked before automatic color support was added.
+    ; indexed colors (not truecolor RGB) here is deliberate.
     color_schemes:
-    db 0x1b,"[1;32m", 0x1b,"[0;32m", 0x1b,"[2;32m"  ; 0 green  (default)
-    db 0x1b,"[1;31m", 0x1b,"[0;31m", 0x1b,"[2;31m"  ; 1 red
-    db 0x1b,"[1;34m", 0x1b,"[0;34m", 0x1b,"[2;34m"  ; 2 blue
-    db 0x1b,"[1;36m", 0x1b,"[0;36m", 0x1b,"[2;36m"  ; 3 cyan
-    db 0x1b,"[1;33m", 0x1b,"[0;33m", 0x1b,"[2;33m"  ; 4 yellow
+    db 0x1b,"[0;92m", 0x1b,"[0;32m", 0x1b,"[2;32m"  ; 0 green  (default)
+    db 0x1b,"[0;91m", 0x1b,"[0;31m", 0x1b,"[2;31m"  ; 1 red
+    db 0x1b,"[0;94m", 0x1b,"[0;34m", 0x1b,"[2;34m"  ; 2 blue
+    db 0x1b,"[0;96m", 0x1b,"[0;36m", 0x1b,"[2;36m"  ; 3 cyan
+    db 0x1b,"[0;93m", 0x1b,"[0;33m", 0x1b,"[2;33m"  ; 4 yellow
     db 0x1b,"[0;97m", 0x1b,"[0;37m", 0x1b,"[2;37m"  ; 5 white
     SCHEME_SZ equ 21            ; bytes per scheme (3 × 7-byte sequences)
 
