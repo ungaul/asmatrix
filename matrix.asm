@@ -74,7 +74,7 @@ section .data
     seq_cls_len     equ $ - seq_cls
 
     ; head is always bright white regardless of color scheme
-    clr_head        db 0x1b, "[1;97m"
+    clr_head        db 0x1b, "[1;38;2;255;255;255m"
     clr_head_len    equ $ - clr_head
     clr_erase       db 0x1b, "[0m "
     clr_erase_len   equ $ - clr_erase
