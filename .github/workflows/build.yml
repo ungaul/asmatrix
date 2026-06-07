@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y nasm binutils zip
+        run: sudo apt-get update && sudo apt-get install -y nasm binutils
 
       - name: Build
         run: make
@@ -49,19 +49,10 @@ jobs:
       - name: Rename for release
         run: mv asmatrix asmatrix-linux-x86_64
 
-      - name: Create source archives
-        run: |
-          tar -czf /tmp/asmatrix-src.tar.gz --exclude='.git' .
-          zip -r /tmp/asmatrix-src.zip . -x '.git/*'
-          mv /tmp/asmatrix-src.tar.gz .
-          mv /tmp/asmatrix-src.zip .
-
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           name: Latest Build
           files: |
             asmatrix-linux-x86_64
-            asmatrix-src.zip
-            asmatrix-src.tar.gz
           generate_release_notes: false
