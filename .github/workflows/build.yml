@@ -45,8 +45,10 @@ jobs:
 
       - name: Create source archives
         run: |
-          tar -czf asmatrix-src.tar.gz --exclude='.git' --exclude='asmatrix-src.tar.gz' .
-          zip -r asmatrix-src.zip . -x '.git/*' -x 'asmatrix-src.zip'
+          tar -czf /tmp/asmatrix-src.tar.gz --exclude='.git' .
+          zip -r /tmp/asmatrix-src.zip . -x '.git/*'
+          mv /tmp/asmatrix-src.tar.gz .
+          mv /tmp/asmatrix-src.zip .
 
       - uses: softprops/action-gh-release@v2
         with:
