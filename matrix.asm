@@ -1,5 +1,5 @@
 ; Matrix rain – pure x86-64 Linux NASM assembly
-; Usage: ./matrix [--density=1-9] [--speed=1-9] [--color=green|red|blue|cyan|yellow|white]
+; Usage: ./matrix [--density 1-9] [--speed 1-9] [--color green|red|blue|cyan|yellow|white]
 
 DEFAULT REL
 global _start
@@ -10,6 +10,14 @@ RAND_BUF    equ 256
 TIOCGWINSZ  equ 0x5413
 SA_RESTORER equ 0x04000000
 SCHEME_SZ   equ 21             ; bytes per color scheme (3 seqs × 7 bytes)
+
+; terminal raw-mode / non-blocking input
+TCGETS      equ 0x5401
+TCSETS      equ 0x5402
+F_SETFL     equ 4
+O_NONBLOCK  equ 0x800
+ICANON      equ 0x0002
+ECHO        equ 0x0008
 
 section .bss
     ws_row      resw 1
@@ -30,6 +38,9 @@ section .bss
     urand_fd    resq 1
     dec_scratch resb 32
     sigact      resb 32
+    orig_termios resb 64
+    raw_termios  resb 64
+    input_buf    resb 16
 
     ; runtime config (set to defaults in _start, then overridden by CLI args)
     cfg_density     resb 1      ; 0-8  (user input 1-9, stored as index)
@@ -100,20 +111,29 @@ section .data
     newline         db 0x0a
 
     help_text:
-    db "Usage: matrix [--density=1-9] [--speed=1-9] [--color=SCHEME]", 0x0a
+    db "Usage: matrix [--density 1-9] [--speed 1-9] [--color SCHEME]", 0x0a
     db 0x0a
     db "Options:", 0x0a
-    db "  --density=1-9   Column density   (1=sparse ... 9=dense,  default 5)", 0x0a
-    db "  --speed=1-9     Animation speed  (1=slow   ... 9=fast,   default 5)", 0x0a
-    db "  --color=SCHEME  Color scheme     (default: green)", 0x0a
+    db "  --density 1-9   Column density   (1=sparse ... 9=dense,  default 5)", 0x0a
+    db "  --speed 1-9     Animation speed  (1=slow   ... 9=fast,   default 7)", 0x0a
+    db "  --color SCHEME  Color scheme     (default: green)", 0x0a
     db "                  Schemes: green  red  blue  cyan  yellow  white", 0x0a
     db "  --help          Show this message", 0x0a
+    db 0x0a
+    db "While running: Up/Down arrows adjust speed, Ctrl+C quits.", 0x0a
     help_text_len equ $ - help_text
 
 section .text
 
 ; ── signal handler ────────────────────────────────────────────────────────────
 sig_handler:
+    ; restore original terminal settings (echo / canonical mode)
+    mov     rax, 16             ; ioctl
+    mov     rdi, 0              ; stdin
+    mov     rsi, TCSETS
+    lea     rdx, [orig_termios]
+    syscall
+
     mov     rax, 1
     mov     rdi, 1
     lea     rsi, [seq_show]
@@ -465,9 +485,70 @@ update_and_draw:
     pop     rbx
     ret
 
+; ── read_input ────────────────────────────────────────────────────────────────
+; Drains pending stdin (non-blocking, terminal in raw/no-echo mode) and reacts
+; to arrow keys: Up (ESC [ A) speeds the animation up, Down (ESC [ B) slows it
+; down. Any other key is silently discarded — nothing gets echoed to the tty.
+; Ctrl+C still raises SIGINT (ISIG stays enabled) and is handled by sig_handler.
+read_input:
+    push    rbx
+    push    r12
+    push    r13
+    xor     rax, rax            ; sys_read
+    xor     rdi, rdi            ; fd 0 (stdin)
+    lea     rsi, [input_buf]
+    mov     rdx, 15
+    syscall
+    test    rax, rax
+    jle     .done               ; no data available (EAGAIN) or error
+    mov     r12, rax            ; bytes read
+    xor     rbx, rbx            ; scan index
+.scan:
+    cmp     rbx, r12
+    jge     .done
+    movzx   eax, byte [input_buf + rbx]
+    cmp     al, 0x1b
+    jne     .next
+    lea     r13, [rbx + 2]
+    cmp     r13, r12
+    jg      .next               ; not enough bytes for a full escape sequence
+    cmp     byte [input_buf + rbx + 1], '['
+    jne     .next
+    movzx   eax, byte [input_buf + rbx + 2]
+    cmp     al, 'A'
+    je      .speed_up
+    cmp     al, 'B'
+    je      .speed_down
+    jmp     .next
+.speed_up:
+    cmp     byte [cfg_speed], 8
+    jge     .skip_seq
+    inc     byte [cfg_speed]
+    call    apply_config
+    jmp     .skip_seq
+.speed_down:
+    cmp     byte [cfg_speed], 0
+    jle     .skip_seq
+    dec     byte [cfg_speed]
+    call    apply_config
+.skip_seq:
+    add     rbx, 3
+    jmp     .scan
+.next:
+    inc     rbx
+    jmp     .scan
+.done:
+    pop     r13
+    pop     r12
+    pop     rbx
+    ret
+
 ; ── parse_arg ─────────────────────────────────────────────────────────────────
 ; rdi = arg string (not modified)
-; → rax: 0 = handled, 1 = --help, 2 = unrecognised -- option
+; rsi = next arg string, or 0 if this is the last argv entry
+;       (used as the value for options like "--speed 9")
+; → rax: 0 = handled, 1 = --help, 2 = unrecognised -- option,
+;        3 = handled and the value in rsi was consumed too
 parse_arg:
     cmp     byte [rdi], '-'
     jne     .ok             ; not a flag at all → ignore
@@ -507,14 +588,16 @@ parse_arg:
     jne     .unknown
     cmp     byte [rdi +  8], 'y'
     jne     .unknown
-    cmp     byte [rdi +  9], '='
+    cmp     byte [rdi +  9], 0
     jne     .unknown
-    movzx   eax, byte [rdi + 10]
+    test    rsi, rsi
+    jz      .unknown
+    movzx   eax, byte [rsi]
     sub     al, '1'
     cmp     al, 8
     ja      .unknown
     mov     [cfg_density], al
-    jmp     .ok
+    jmp     .consumed
 
 .speed:
     cmp     byte [rdi + 3], 'p'
@@ -525,14 +608,16 @@ parse_arg:
     jne     .unknown
     cmp     byte [rdi + 6], 'd'
     jne     .unknown
-    cmp     byte [rdi + 7], '='
+    cmp     byte [rdi + 7], 0
     jne     .unknown
-    movzx   eax, byte [rdi + 8]
+    test    rsi, rsi
+    jz      .unknown
+    movzx   eax, byte [rsi]
     sub     al, '1'
     cmp     al, 8
     ja      .unknown
     mov     [cfg_speed], al
-    jmp     .ok
+    jmp     .consumed
 
 .color:
     cmp     byte [rdi + 3], 'o'
@@ -543,9 +628,11 @@ parse_arg:
     jne     .unknown
     cmp     byte [rdi + 6], 'r'
     jne     .unknown
-    cmp     byte [rdi + 7], '='
+    cmp     byte [rdi + 7], 0
     jne     .unknown
-    movzx   eax, byte [rdi + 8]
+    test    rsi, rsi
+    jz      .unknown
+    movzx   eax, byte [rsi]
     cmp     al, 'g'
     je      .c0
     cmp     al, 'r'
@@ -560,16 +647,20 @@ parse_arg:
     je      .c5
     jmp     .unknown
 .c0: mov byte [cfg_color], 0  ; green
-     jmp .ok
+     jmp .consumed
 .c1: mov byte [cfg_color], 1  ; red
-     jmp .ok
+     jmp .consumed
 .c2: mov byte [cfg_color], 2  ; blue
-     jmp .ok
+     jmp .consumed
 .c3: mov byte [cfg_color], 3  ; cyan
-     jmp .ok
+     jmp .consumed
 .c4: mov byte [cfg_color], 4  ; yellow
-     jmp .ok
+     jmp .consumed
 .c5: mov byte [cfg_color], 5  ; white
+
+.consumed:
+    mov     eax, 3              ; handled, and the value arg was consumed too
+    ret
 
 .ok:
     xor     eax, eax
@@ -691,9 +782,9 @@ _start:
 .cols_ok2:
     mov     [cols], rax
 
-    ; set defaults: density 5, speed 5, color green  (indices are 0-based)
+    ; set defaults: density 5, speed 7, color green  (indices are 0-based)
     mov     byte [cfg_density], 4
-    mov     byte [cfg_speed],   4
+    mov     byte [cfg_speed],   6
     mov     byte [cfg_color],   0
 
     ; parse argv
@@ -704,13 +795,24 @@ _start:
     test    r13, r13
     jz      .arg_done
     mov     rdi, [r15]
+    xor     rsi, rsi            ; rsi = next arg, or 0 if none follows
+    cmp     r13, 1
+    jle     .no_next_arg
+    mov     rsi, [r15 + 8]
+.no_next_arg:
     call    parse_arg
     cmp     rax, 1
     je      .do_help
     cmp     rax, 2
     je      .do_unknown
+    cmp     rax, 3
+    je      .consumed_two
     add     r15, 8
     dec     r13
+    jmp     .arg_loop
+.consumed_two:
+    add     r15, 16
+    sub     r13, 2
     jmp     .arg_loop
 .do_help:
     xor     rdi, rdi            ; exit code 0
@@ -745,6 +847,37 @@ _start:
     lea     rsi, [sigact]
     xor     rdx, rdx
     mov     r10, 8
+    syscall
+
+    ; ── put the tty into raw mode: no echo, no line buffering ────────────────
+    ; (ISIG stays on, so Ctrl+C still raises SIGINT → handled by sig_handler,
+    ;  which restores these settings before exiting)
+    mov     rax, 16             ; ioctl
+    mov     rdi, 0              ; stdin
+    mov     rsi, TCGETS
+    lea     rdx, [orig_termios]
+    syscall
+
+    lea     rsi, [orig_termios]
+    lea     rdi, [raw_termios]
+    mov     rcx, 36
+    rep     movsb
+
+    mov     eax, [raw_termios + 12]     ; c_lflag
+    and     eax, ~(ICANON | ECHO)
+    mov     [raw_termios + 12], eax
+
+    mov     rax, 16
+    mov     rdi, 0
+    mov     rsi, TCSETS
+    lea     rdx, [raw_termios]
+    syscall
+
+    ; make stdin reads non-blocking so the render loop never stalls on input
+    mov     rax, 72             ; fcntl
+    mov     rdi, 0
+    mov     rsi, F_SETFL
+    mov     rdx, O_NONBLOCK
     syscall
 
     ; hide cursor and clear screen
@@ -787,6 +920,7 @@ _start:
 .loop:
     call    update_and_draw
     call    flush
+    call    read_input
 
     mov     rax, 35
     lea     rdi, [tv_sec]
