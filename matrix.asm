@@ -1,5 +1,6 @@
 ; Matrix rain – pure x86-64 Linux NASM assembly
-; Usage: ./matrix [--density 1-9] [--speed 1-9] [--color green|red|blue|cyan|yellow|white]
+; Usage: ./matrix [--density 1-9] [--speed 1-9] [--color SPEC]
+;   SPEC = name (green|red|blue|cyan|yellow|white) | hex (#RRGGBB) | ANSI 0-255
 
 DEFAULT REL
 global _start
@@ -9,7 +10,6 @@ BUF_SIZE    equ 65536
 RAND_BUF    equ 256
 TIOCGWINSZ  equ 0x5413
 SA_RESTORER equ 0x04000000
-SCHEME_SZ   equ 21             ; bytes per color scheme (3 seqs × 7 bytes)
 
 ; terminal raw-mode / non-blocking input
 TCGETS      equ 0x5401
@@ -45,7 +45,10 @@ section .bss
     ; runtime config (set to defaults in _start, then overridden by CLI args)
     cfg_density     resb 1      ; 0-8  (user input 1-9, stored as index)
     cfg_speed       resb 1      ; 0-8
-    cfg_color       resb 1      ; 0-5
+    cfg_color_mode  resb 1      ; 0 = named (table idx), 1 = truecolor RGB, 2 = ANSI-256
+    cfg_color_a     resb 1      ; named: color_schemes index | RGB: red | ANSI-256: index
+    cfg_color_b     resb 1      ; RGB: green (unused for named / ANSI-256)
+    cfg_color_c     resb 1      ; RGB: blue  (unused for named / ANSI-256)
 
     ; derived from config by apply_config
     seed_thresh     resb 1      ; rand_byte < thresh → seed column
@@ -54,7 +57,11 @@ section .bss
     g_max_speed     resb 1
     g_min_len       resb 1      ; drop: min trail length
     g_max_len       resb 1
-    color_scheme_ptr resq 1     ; pointer to active scheme in color_schemes
+
+    ; generated ANSI sequences for the active color: bright(0)/normal(1)/dark(2),
+    ; each up to 32 bytes (longest possible is "\x1b[1;38;2;255;255;255m" = 21 bytes)
+    scheme_seq      resb 96
+    scheme_seq_len  resq 3
 
 section .data
     dev_urandom     db "/dev/urandom", 0
@@ -72,9 +79,12 @@ section .data
     clr_erase       db 0x1b, "[0m "
     clr_erase_len   equ $ - clr_erase
 
-    ; ── color schemes ─────────────────────────────────────────────────────────
-    ; Each scheme = 3 × 7-byte ANSI sequences: bright, normal, dark
-    ; Accessed via color_scheme_ptr + offset (0, 7, 14)
+    ; ── named color schemes ───────────────────────────────────────────────────
+    ; Each = 3 × 7-byte indexed-ANSI sequences (bright, normal, dark). Using
+    ; indexed colors (not truecolor RGB) here is deliberate: it lets the
+    ; terminal's own palette/theme render the bold/normal/dim variants, which
+    ; gives that familiar muted, low-contrast trail fade — exactly how this
+    ; looked before automatic color support was added.
     color_schemes:
     db 0x1b,"[1;32m", 0x1b,"[0;32m", 0x1b,"[2;32m"  ; 0 green  (default)
     db 0x1b,"[1;31m", 0x1b,"[0;31m", 0x1b,"[2;31m"  ; 1 red
@@ -82,6 +92,7 @@ section .data
     db 0x1b,"[1;36m", 0x1b,"[0;36m", 0x1b,"[2;36m"  ; 3 cyan
     db 0x1b,"[1;33m", 0x1b,"[0;33m", 0x1b,"[2;33m"  ; 4 yellow
     db 0x1b,"[0;97m", 0x1b,"[0;37m", 0x1b,"[2;37m"  ; 5 white
+    SCHEME_SZ equ 21            ; bytes per scheme (3 × 7-byte sequences)
 
     ; ── density tables (index 0=density1 … 8=density9) ───────────────────────
     density_seed_tbl  db   4,  8, 16, 22, 30, 42, 60, 90, 128
@@ -111,13 +122,13 @@ section .data
     newline         db 0x0a
 
     help_text:
-    db "Usage: matrix [--density 1-9] [--speed 1-9] [--color SCHEME]", 0x0a
+    db "Usage: matrix [--density 1-9] [--speed 1-9] [--color SPEC]", 0x0a
     db 0x0a
     db "Options:", 0x0a
     db "  --density 1-9   Column density   (1=sparse ... 9=dense,  default 5)", 0x0a
     db "  --speed 1-9     Animation speed  (1=slow   ... 9=fast,   default 7)", 0x0a
-    db "  --color SCHEME  Color scheme     (default: green)", 0x0a
-    db "                  Schemes: green  red  blue  cyan  yellow  white", 0x0a
+    db "  --color SPEC    Color: name, hex (#RRGGBB), or ANSI 0-255  (default: green)", 0x0a
+    db "                  Names: green  red  blue  cyan  yellow  white", 0x0a
     db "  --help          Show this message", 0x0a
     db 0x0a
     db "While running: Up/Down arrows adjust speed, Ctrl+C quits.", 0x0a
@@ -132,6 +143,13 @@ sig_handler:
     mov     rdi, 0              ; stdin
     mov     rsi, TCSETS
     lea     rdx, [orig_termios]
+    syscall
+
+    ; clear the screen so the rain doesn't linger after we quit
+    mov     rax, 1
+    mov     rdi, 1
+    lea     rsi, [seq_cls]
+    mov     rdx, seq_cls_len
     syscall
 
     mov     rax, 1
@@ -407,7 +425,7 @@ update_and_draw:
     pop     r12
 .skip_erase:
 
-%macro draw_row 2   ; %1=offset from r12, %2=color offset in scheme (or -1 for head)
+%macro draw_row 2   ; %1=offset from r12, %2=brightness level 0/1/2 (bright/normal/dark, or -1 for head)
     mov     rax, r12
     sub     rax, %1
     cmp     rax, 0
@@ -420,9 +438,8 @@ update_and_draw:
     lea     rsi, [clr_head]
     mov     rdx, clr_head_len
 %else
-    mov     rsi, [color_scheme_ptr]
-    add     rsi, %2
-    mov     rdx, 7
+    lea     rsi, [scheme_seq + (%2 * 32)]
+    mov     rdx, [scheme_seq_len + (%2 * 8)]
 %endif
     call    buf_bytes
     call    draw_cell
@@ -431,9 +448,9 @@ update_and_draw:
 %endmacro
 
     draw_row 1, -1   ; head: bright white
-    draw_row 2,  0   ; bright  (scheme offset 0)
-    draw_row 3,  7   ; normal  (scheme offset 7)
-    draw_row 4, 14   ; dark    (scheme offset 14)
+    draw_row 2,  0   ; bright
+    draw_row 3,  1   ; normal
+    draw_row 4,  2   ; dark
 
     jmp     .next_col
 
@@ -470,7 +487,7 @@ update_and_draw:
     call    rand_byte
     movzx   ecx, byte [wake_thresh]
     cmp     al, cl
-    jge     .wake_next
+    jae     .wake_next
     mov     rdi, rbx
     call    init_column
 .wake_next:
@@ -540,6 +557,342 @@ read_input:
 .done:
     pop     r13
     pop     r12
+    pop     rbx
+    ret
+
+; ── hex_val: ASCII hex digit (al) → nibble 0-15, or 0xFF if not a hex digit ──
+hex_val:
+    cmp     al, '0'
+    jb      .bad
+    cmp     al, '9'
+    ja      .alpha
+    sub     al, '0'
+    ret
+.alpha:
+    cmp     al, 'A'
+    jb      .bad
+    cmp     al, 'F'
+    jbe     .upper
+    cmp     al, 'a'
+    jb      .bad
+    cmp     al, 'f'
+    ja      .bad
+    sub     al, 'a' - 10
+    ret
+.upper:
+    sub     al, 'A' - 10
+    ret
+.bad:
+    mov     al, 0xFF
+    ret
+
+; ── dec_to_buf: write decimal ASCII for rax (0-255) at [rdi] ─────────────────
+; → rax: number of bytes written (1-3, no leading zeros)
+dec_to_buf:
+    push    rbx
+    push    rcx
+    push    rdx
+    push    r9
+    push    r10
+    push    r11
+    mov     rbx, rdi
+    xor     rcx, rcx
+    test    rax, rax
+    jnz     .cvt
+    mov     byte [rbx], '0'
+    mov     rcx, 1
+    jmp     .rev_done
+.cvt:
+.dloop:
+    test    rax, rax
+    jz      .rev
+    xor     rdx, rdx
+    mov     r9, 10
+    div     r9
+    add     dl, '0'
+    mov     [rbx + rcx], dl
+    inc     rcx
+    jmp     .dloop
+.rev:
+    xor     r10, r10
+    mov     r11, rcx
+    dec     r11
+.rlp:
+    cmp     r10, r11
+    jge     .rev_done
+    movzx   eax, byte [rbx + r10]
+    movzx   edx, byte [rbx + r11]
+    mov     [rbx + r10], dl
+    mov     [rbx + r11], al
+    inc     r10
+    dec     r11
+    jmp     .rlp
+.rev_done:
+    mov     rax, rcx
+    pop     r11
+    pop     r10
+    pop     r9
+    pop     rdx
+    pop     rcx
+    pop     rbx
+    ret
+
+; ── scale_component: dim a 0-255 channel for the normal/dark trail levels ────
+; eax = channel value, esi = level (0=normal ≈62%, 1=bright =100%, 2=dark ≈25%)
+; → eax = scaled value
+; Truecolor gradients can't rely on the terminal's bold/dim handling — many
+; terminals render SGR 1/2 with truecolor RGB as same-color-different-weight,
+; which flattens the bright/normal/dark trail into one flat shade. Scaling the
+; RGB ourselves guarantees the fade regardless of terminal.
+scale_component:
+    cmp     esi, 1
+    je      .bright
+    cmp     esi, 2
+    je      .dark
+    imul    eax, eax, 5         ; normal ≈ value * 5/8
+    shr     eax, 3
+    ret
+.dark:
+    shr     eax, 2              ; dark ≈ value / 4
+    ret
+.bright:
+    ret
+
+; ── emit_color_seq: build one ANSI SGR sequence at [rdi] ──────────────────────
+; Only used for explicit hex / ANSI-256 color specs (cfg_color_mode 1 or 2);
+; named colors are handled directly from the static color_schemes table in
+; apply_config, so the terminal's own palette can render them.
+; rdi = dest buffer, rsi = brightness level (0=normal, 1=bright, 2=dark)
+; Reads cfg_color_mode/cfg_color_a/b/c.
+;   mode 1 truecolor: "ESC[0;38;2;R;G;Bm" with R/G/B scaled per level (the
+;              fade lives in the color itself, so the leading attr stays plain)
+;   mode 2 ANSI-256:  "ESC[<level>;38;5;Nm" — palette brightness can't be
+;              scaled, so fall back to varying bold/normal/dim like before
+; → rax: length written
+emit_color_seq:
+    push    rbx
+    push    rcx
+    push    rdx
+    push    r12
+    push    r13
+    mov     r12, rdi            ; r12 = sequence start (for length calc)
+    mov     rbx, rdi            ; rbx = write cursor
+    mov     r13, rsi            ; r13 = level (0/1/2)
+
+    mov     byte [rbx], 0x1b
+    mov     byte [rbx + 1], '['
+    add     rbx, 2
+
+    cmp     byte [cfg_color_mode], 2
+    je      .attr_indexed
+    mov     byte [rbx], '0'     ; truecolor: gradient comes from scaled RGB
+    jmp     .attr_done
+.attr_indexed:
+    mov     al, r13b
+    add     al, '0'
+    mov     [rbx], al
+.attr_done:
+    inc     rbx
+    mov     byte [rbx], ';'
+    inc     rbx
+    mov     byte [rbx], '3'
+    mov     byte [rbx + 1], '8'
+    mov     byte [rbx + 2], ';'
+    add     rbx, 3
+
+    cmp     byte [cfg_color_mode], 2
+    je      .ansi256
+
+    ; truecolor: "2;R;G;Bm" with each channel scaled to this brightness level
+    mov     byte [rbx], '2'
+    mov     byte [rbx + 1], ';'
+    add     rbx, 2
+
+    movzx   eax, byte [cfg_color_a]
+    mov     esi, r13d
+    call    scale_component
+    mov     rdi, rbx
+    call    dec_to_buf
+    add     rbx, rax
+    mov     byte [rbx], ';'
+    inc     rbx
+
+    movzx   eax, byte [cfg_color_b]
+    mov     esi, r13d
+    call    scale_component
+    mov     rdi, rbx
+    call    dec_to_buf
+    add     rbx, rax
+    mov     byte [rbx], ';'
+    inc     rbx
+
+    movzx   eax, byte [cfg_color_c]
+    mov     esi, r13d
+    call    scale_component
+    mov     rdi, rbx
+    call    dec_to_buf
+    add     rbx, rax
+    jmp     .finish
+
+.ansi256:
+    ; indexed: "5;Nm"
+    mov     byte [rbx], '5'
+    mov     byte [rbx + 1], ';'
+    add     rbx, 2
+    movzx   rax, byte [cfg_color_a]
+    mov     rdi, rbx
+    call    dec_to_buf
+    add     rbx, rax
+
+.finish:
+    mov     byte [rbx], 'm'
+    inc     rbx
+    mov     rax, rbx
+    sub     rax, r12
+    pop     r13
+    pop     r12
+    pop     rdx
+    pop     rcx
+    pop     rbx
+    ret
+
+; ── parse_color_value ─────────────────────────────────────────────────────────
+; rsi = pointer to color spec string (null-terminated)
+; Accepts: "#RRGGBB" / "RRGGBB" hex, a 0-255 ANSI-256 decimal code, or one of
+; the known color names (matched by first letter, as before).
+; On success sets cfg_color_mode/a/b/c and returns rax = 0; returns rax = 1
+; if the spec isn't recognised (cfg_color_* left untouched).
+parse_color_value:
+    push    rbx
+    push    rcx
+    push    rdx
+    push    r12
+
+    mov     rbx, rsi
+    cmp     byte [rbx], '#'
+    jne     .try_hex
+    inc     rbx
+
+.try_hex:
+    xor     rcx, rcx
+.hexcheck:
+    cmp     rcx, 6
+    jge     .hexcheck_term
+    movzx   eax, byte [rbx + rcx]
+    call    hex_val
+    cmp     al, 0xFF
+    je      .not_hex
+    inc     rcx
+    jmp     .hexcheck
+.hexcheck_term:
+    cmp     byte [rbx + 6], 0
+    jne     .not_hex
+
+    ; valid 6-digit hex → RGB
+    movzx   eax, byte [rbx + 0]
+    call    hex_val
+    mov     r12b, al
+    shl     r12b, 4
+    movzx   eax, byte [rbx + 1]
+    call    hex_val
+    or      r12b, al
+    mov     [cfg_color_a], r12b
+    movzx   eax, byte [rbx + 2]
+    call    hex_val
+    mov     r12b, al
+    shl     r12b, 4
+    movzx   eax, byte [rbx + 3]
+    call    hex_val
+    or      r12b, al
+    mov     [cfg_color_b], r12b
+    movzx   eax, byte [rbx + 4]
+    call    hex_val
+    mov     r12b, al
+    shl     r12b, 4
+    movzx   eax, byte [rbx + 5]
+    call    hex_val
+    or      r12b, al
+    mov     [cfg_color_c], r12b
+    mov     byte [cfg_color_mode], 1    ; 1 = truecolor RGB
+    xor     eax, eax
+    jmp     .done
+
+.not_hex:
+    cmp     byte [rsi], '#'
+    je      .fail               ; "#..." that isn't valid 6-digit hex → reject
+
+    ; decimal ANSI-256 code (1-3 digits, value 0-255)
+    xor     rcx, rcx
+    xor     r12, r12
+.numcheck:
+    movzx   eax, byte [rbx + rcx]
+    test    al, al
+    jz      .numcheck_done
+    cmp     al, '0'
+    jb      .not_numeric
+    cmp     al, '9'
+    ja      .not_numeric
+    cmp     rcx, 3
+    jge     .not_numeric
+    imul    r12, r12, 10
+    movzx   eax, al
+    sub     eax, '0'
+    add     r12, rax
+    inc     rcx
+    jmp     .numcheck
+.numcheck_done:
+    test    rcx, rcx
+    jz      .not_numeric
+    cmp     r12, 255
+    ja      .not_numeric
+    mov     byte [cfg_color_a], r12b
+    mov     byte [cfg_color_mode], 2    ; 2 = ANSI-256 indexed
+    xor     eax, eax
+    jmp     .done
+
+.not_numeric:
+    ; known color names, matched by first letter (kept simple, like before).
+    ; These map to indices into color_schemes (mode 0): letting the terminal
+    ; render indexed-ANSI bold/normal/dim is what gives that familiar muted
+    ; trail fade, themed by whatever palette the user's terminal applies.
+    movzx   eax, byte [rbx]
+    cmp     al, 'g'
+    je      .name_green
+    cmp     al, 'r'
+    je      .name_red
+    cmp     al, 'b'
+    je      .name_blue
+    cmp     al, 'c'
+    je      .name_cyan
+    cmp     al, 'y'
+    je      .name_yellow
+    cmp     al, 'w'
+    je      .name_white
+    jmp     .fail
+
+.name_green:  mov byte [cfg_color_a], 0
+              jmp .name_done
+.name_red:    mov byte [cfg_color_a], 1
+              jmp .name_done
+.name_blue:   mov byte [cfg_color_a], 2
+              jmp .name_done
+.name_cyan:   mov byte [cfg_color_a], 3
+              jmp .name_done
+.name_yellow: mov byte [cfg_color_a], 4
+              jmp .name_done
+.name_white:  mov byte [cfg_color_a], 5
+.name_done:
+    mov     byte [cfg_color_mode], 0    ; 0 = named (color_schemes table index)
+    xor     eax, eax
+    jmp     .done
+
+.fail:
+    mov     eax, 1
+
+.done:
+    pop     r12
+    pop     rdx
+    pop     rcx
     pop     rbx
     ret
 
@@ -632,31 +985,10 @@ parse_arg:
     jne     .unknown
     test    rsi, rsi
     jz      .unknown
-    movzx   eax, byte [rsi]
-    cmp     al, 'g'
-    je      .c0
-    cmp     al, 'r'
-    je      .c1
-    cmp     al, 'b'
-    je      .c2
-    cmp     al, 'c'
-    je      .c3
-    cmp     al, 'y'
-    je      .c4
-    cmp     al, 'w'
-    je      .c5
-    jmp     .unknown
-.c0: mov byte [cfg_color], 0  ; green
-     jmp .consumed
-.c1: mov byte [cfg_color], 1  ; red
-     jmp .consumed
-.c2: mov byte [cfg_color], 2  ; blue
-     jmp .consumed
-.c3: mov byte [cfg_color], 3  ; cyan
-     jmp .consumed
-.c4: mov byte [cfg_color], 4  ; yellow
-     jmp .consumed
-.c5: mov byte [cfg_color], 5  ; white
+    call    parse_color_value   ; rsi = color spec string; sets cfg_color_*
+    test    rax, rax
+    jnz     .unknown            ; not a recognised name / hex / ANSI code
+    jmp     .consumed
 
 .consumed:
     mov     eax, 3              ; handled, and the value arg was consumed too
@@ -734,12 +1066,52 @@ apply_config:
     movzx   rcx, byte [drop_len_max_tbl + rax]
     mov     [g_max_len], cl
 
-    ; color → scheme pointer
-    movzx   eax, byte [cfg_color]
-    imul    eax, eax, SCHEME_SZ
-    lea     rcx, [color_schemes + rax]
-    mov     [color_scheme_ptr], rcx
+    ; color → fill scheme_seq with bright(0)/normal(1)/dark(2) sequences
+    cmp     byte [cfg_color_mode], 0
+    jne     .color_dynamic
 
+    ; named: copy the matching scheme's 3 × 7-byte sequences from color_schemes
+    ; (packed back-to-back) into the 32-byte-aligned scheme_seq slots, so the
+    ; terminal's own palette renders the bold/normal/dim trail fade
+    movzx   eax, byte [cfg_color_a]
+    imul    eax, eax, SCHEME_SZ
+    lea     rsi, [color_schemes + rax]
+
+    lea     rdi, [scheme_seq]
+    mov     rcx, 7
+    rep     movsb               ; bright  (rsi/rdi both auto-advance by 7)
+
+    lea     rdi, [scheme_seq + 32]
+    mov     rcx, 7
+    rep     movsb               ; normal
+
+    lea     rdi, [scheme_seq + 64]
+    mov     rcx, 7
+    rep     movsb               ; dark
+
+    mov     qword [scheme_seq_len + 0*8], 7
+    mov     qword [scheme_seq_len + 1*8], 7
+    mov     qword [scheme_seq_len + 2*8], 7
+    jmp     .color_done
+
+.color_dynamic:
+    ; hex / ANSI-256: generate bright(1)/normal(0)/dark(2) sequences
+    lea     rdi, [scheme_seq]
+    mov     rsi, 1
+    call    emit_color_seq
+    mov     [scheme_seq_len + 0*8], rax
+
+    lea     rdi, [scheme_seq + 32]
+    xor     rsi, rsi
+    call    emit_color_seq
+    mov     [scheme_seq_len + 1*8], rax
+
+    lea     rdi, [scheme_seq + 64]
+    mov     rsi, 2
+    call    emit_color_seq
+    mov     [scheme_seq_len + 2*8], rax
+
+.color_done:
     ret
 
 ; ── _start ────────────────────────────────────────────────────────────────────
@@ -782,10 +1154,11 @@ _start:
 .cols_ok2:
     mov     [cols], rax
 
-    ; set defaults: density 5, speed 7, color green  (indices are 0-based)
+    ; set defaults: density 7, speed 5, color green  (indices are 0-based)
     mov     byte [cfg_density], 4
     mov     byte [cfg_speed],   6
-    mov     byte [cfg_color],   0
+    mov     byte [cfg_color_mode], 0    ; 0 = named (color_schemes table index)
+    mov     byte [cfg_color_a], 0       ; index 0 = green
 
     ; parse argv
     mov     r13, [r14]          ; argc
@@ -903,7 +1276,7 @@ _start:
     call    rand_byte
     movzx   ecx, byte [seed_thresh]
     cmp     al, cl
-    jge     .seed_skip
+    jae     .seed_skip
     mov     rdi, rbx
     call    init_column
     call    rand_byte
