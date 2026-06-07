@@ -2,7 +2,7 @@
 
 Matrix rain in pure x86-64 Linux assembly. Runs in about 40KB RSS.
 
-![color picker](./assets/demo.gif)
+![color picker](./assets/demo.gif?raw=true)
 
 ## Install
 ```bash
