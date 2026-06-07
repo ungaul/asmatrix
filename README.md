@@ -6,7 +6,7 @@ Matrix rain in pure x86-64 Linux assembly.
 
  Benchmarks:
 | Metric | asmatrix | cmatrix |
-|---|---|---|---|
+|---|---|---|
 | CPU cycles | 11,251,832 | 193,819,938 |
 | Instructions | 10,825,898 | 220,158,233 |
 | Cache misses | 3,897 | 156,683 |
