@@ -1,0 +1,71 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y nasm binutils-aarch64-linux-gnu qemu-user
+      - name: Build
+        run: |
+          make
+          make arm64
+          make windows
+          mkdir dist
+          cp asmatrix dist/asmatrix-linux-x86_64
+          cp asmatrix-arm64 dist/asmatrix-linux-arm64
+          cp asmatrix.exe dist/asmatrix-windows-x64.exe
+      - name: Test x86-64
+        run: |
+          ./dist/asmatrix-linux-x86_64 --help > /dev/null
+          if ./dist/asmatrix-linux-x86_64 --bogus > /dev/null 2>&1; then exit 1; fi
+      - name: Test ARM64
+        run: |
+          qemu-aarch64 ./dist/asmatrix-linux-arm64 --help > /dev/null
+          if qemu-aarch64 ./dist/asmatrix-linux-arm64 --bogus > /dev/null 2>&1; then exit 1; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  windows:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Test
+        shell: pwsh
+        run: |
+          ./dist/asmatrix-windows-x64.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ./dist/asmatrix-windows-x64.exe --bogus 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 1) { exit 1 }
+          ./dist/asmatrix-windows-x64.exe --color '#ff8800' --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+  release:
+    needs: [build, windows]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Publish latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --cleanup-tag --yes --repo "$GITHUB_REPOSITORY" || true
+          gh release create latest dist/* --title latest --notes "Built from $GITHUB_SHA" --target "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
